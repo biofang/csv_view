@@ -2,4 +2,4 @@
 /*.txt
 /*.csv
 
-**/*.bak
+./scr/*bak
