@@ -1,0 +1,211 @@
+use anyhow::{Error,Ok,Result};
+use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, *}; // Table
+use std::{
+    fs::File,
+    io::{self,prelude::*,BufRead,BufReader},
+    path::{Path,PathBuf},
+};
+// use std::time::Instant;
+use csv::ReaderBuilder;
+use clap::{value_parser, Parser};
+
+const MAGIC_MAX_LEN: usize = 6;
+const BUFF_SIZE: usize = 1024 * 1024;
+const GZ_MAGIC: [u8; 3] = [0x1f, 0x8b, 0x08];
+
+fn magic_num<P>(file_name: P) -> Result<[u8; MAGIC_MAX_LEN], Error>
+where
+    P: AsRef<Path> + Copy,
+{
+    let mut buffer: [u8; MAGIC_MAX_LEN] = [0; MAGIC_MAX_LEN];
+    let mut fp = File::open(file_name)?;
+
+    let _ = fp.read(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn is_gzipped<P>(file_name: P) -> Result<bool>
+where
+    P: AsRef<Path> + Copy,
+{
+    let buffer = magic_num(file_name)?;
+    let gz_or_not =
+        buffer[0] == GZ_MAGIC[0] && buffer[1] == GZ_MAGIC[1] && buffer[2] == GZ_MAGIC[2];
+    Ok(gz_or_not
+        || file_name
+            .as_ref()
+            .extension()
+            .is_some_and(|ext| ext == "gz"))
+}
+
+pub fn file_reader<P>(file_in: Option<P>) -> Result<Box<dyn BufRead>>
+where
+    P: AsRef<Path> + Copy,
+{
+    if let Some(file_name) = file_in {
+        let gz_flag = is_gzipped(file_name)?;
+
+        let fp = File::open(file_name)?;
+
+        if gz_flag {
+            Ok(Box::new(BufReader::with_capacity(
+                BUFF_SIZE,
+                flate2::read::MultiGzDecoder::new(fp),
+            )))
+        } else {
+            Ok(Box::new(BufReader::with_capacity(BUFF_SIZE, fp)))
+        }
+    } else {
+        if atty::is(atty::Stream::Stdin) {
+            // error!("{}", Xerror::StdinNotDetected);
+            std::process::exit(1);
+        }
+        let fp = BufReader::new(io::stdin());
+        Ok(Box::new(fp))
+    }
+}
+
+fn view_csv(
+    delimiter: u8,
+    table_width: Option<u16>,
+    cell_height: Option<usize>,
+    alignment: &str,
+    header: bool,
+    column_index:bool,
+    csv: Option<PathBuf>,
+) -> Result<(),Error> {
+    let mut csv_reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(file_reader(csv.as_ref())?);
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::DynamicFullWidth);
+
+    // set whole table width
+    if let Some(width) = table_width {
+        table.set_width(width);  // 设置整个表格的宽度
+    } else {
+        table.width(); // 获取表格的预期宽度
+    }
+// -------------------
+    if column_index {
+        let mut tmp_csv_reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(file_reader(csv.as_ref())?);
+
+        let col_num =  tmp_csv_reader.records().next().unwrap()?.len();
+
+        let mut col_row = Row::new();
+
+        if let Some(height) = cell_height {
+            col_row.max_height(height);
+        }
+        let col_vec: Vec<usize> = (0..col_num).map(|x| x + 1).collect();
+        for index in col_vec{
+            let cell: Cell = match alignment {
+                "left" => Cell::new(index).set_alignment(CellAlignment::Left).add_attribute(Attribute::Bold).fg(Color::Green),
+                "center" => Cell::new(index).set_alignment(CellAlignment::Center).add_attribute(Attribute::Bold).fg(Color::Green),
+                "right" => Cell::new(index).set_alignment(CellAlignment::Right).add_attribute(Attribute::Bold).fg(Color::Green),
+                _ => Cell::new(index),
+            };
+            col_row.add_cell(cell);
+        }
+        table.add_row(col_row);   
+    }
+
+// ----------------------
+    let mut n = 0usize;
+    for rec in csv_reader.records().flatten() {
+        n += 1;
+
+        let mut row = Row::new();
+        // set cell max height
+        if let Some(height) = cell_height {
+            row.max_height(height);
+        }
+
+        for each in rec.iter() {
+
+            let cell: Cell = match alignment {
+                "left" => Cell::new(each).set_alignment(CellAlignment::Left),
+                "center" => Cell::new(each).set_alignment(CellAlignment::Center),
+                "right" => Cell::new(each).set_alignment(CellAlignment::Right),
+                _ => Cell::new(each),
+            };
+            row.add_cell(cell);
+        }
+
+        //csv has header
+        // header为true ,column_index为false
+        if header && !column_index && n == 1 {
+            table.set_header(row);
+            continue;
+        }
+        table.add_row(row);
+    }
+
+    println!("{}", table);
+
+    Ok(())
+}
+
+
+// Pretty display of CSV table 
+
+#[derive(Debug, Parser)]
+#[command(
+    author = "fangj",
+    version = "version 0.0.2",
+    next_line_help = false,
+    about = "Pretty display of CSV table ",
+    long_about = None,
+)]
+#[command(help_template = "{about}\n\nVersion: {version}\
+    \nAuthors: {author}\
+    \n{before-help}
+{usage-heading} {usage}\n\n{all-args}\n\nUse \"{name} -h\" for more information")]
+
+struct Cli {
+    /// Set the whole table width, Optional
+    #[arg(short = 'w', long = "table_width", value_name = "INT", value_parser = value_parser!(u16).range(0..=65535))]
+    table_width: Option<u16>,
+
+    /// If set, truncate content of cells which occupies more than INT lines of space, Optional
+    #[arg(short = 'c', long = "cell_height", value_name = "INT")]
+    cell_height: Option<usize>,
+    
+    /// Set the alignment of content for each cell, possible values: {left, center, right}
+    #[arg(short ='a', long = "aln", value_name = "STR", default_value_t = String::from("center"))]
+    aln: String,
+    
+    /// Show header in different style, Optional
+    #[arg(short = 'H',long = "header",value_name = "Bool")]
+    header: bool,
+
+    /// Set delimiter, e.g., in linux -d $'\t' for tab, in powershell -d `t for tab
+    #[arg(short = 'd', long = "delimiter", default_value_t = '\t', value_name = "CHAR",)]
+    delimiter: char,
+
+    /// If set, display the column numbers on the first line, Optional. If -n is set, -H will not work.
+    #[arg(short = 'n', long = "column_num",default_value_t=false, value_name = "Bool",)]
+    column_index: bool,
+
+    /// Input CSV file name, if file not specified read data from stdin, [Required]
+    #[arg(value_name = "CSV")]
+    input: Option<PathBuf>,
+}
+
+fn main() -> Result<(), Error>{
+    let args = Cli::parse();
+
+    view_csv(args.delimiter as u8, args.table_width, args.cell_height, &args.aln, args.header,args.column_index, args.input)?;
+    
+    Ok(())
+}
